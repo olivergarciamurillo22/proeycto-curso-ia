@@ -1,4 +1,9 @@
+import json
+import os
+import shutil
+import tempfile
 import unicodedata
+from pathlib import Path
 
 import streamlit as st
 
@@ -67,15 +72,57 @@ ICONOS_CATEGORIA = {
 }
 
 
+CARPETA_SALIDA = Path(__file__).resolve().parent / "output"
+RUTA_EVENTOS = CARPETA_SALIDA / "eventos.json"
+RUTA_TEXTO = CARPETA_SALIDA / "texto.txt"
+RUTAS_TESSERACT = [
+    Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Tesseract-OCR" / "tesseract.exe",
+    Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Tesseract-OCR" / "tesseract.exe",
+]
+
+
 # ============================================================
-# INTEGRACIÓN PERSONA 1: solo hay que cambiar esta función.
+# INTEGRACIÓN PERSONA 1
+# Si existe output/eventos.json (generado por document_processor.py
+# o por la subida de PDF de la barra lateral) se usa; si no, DATOS_DEMO.
 # ============================================================
 def cargar_datos():
-    datos_json = DATOS_DEMO
-    texto_completo = ""
-    # from document_processor import procesar_pdf
-    # datos_json, texto_completo = procesar_pdf("programa.pdf")
+    if RUTA_EVENTOS.is_file():
+        datos_json = json.loads(RUTA_EVENTOS.read_text(encoding="utf-8"))
+        texto_completo = RUTA_TEXTO.read_text(encoding="utf-8") if RUTA_TEXTO.is_file() else ""
+        return datos_json, texto_completo, "output/eventos.json"
+    return DATOS_DEMO, "", "datos demo"
+
+
+def procesar_pdf_subido(archivo):
+    from document_processor import procesar_pdf
+
+    if not shutil.which("tesseract"):
+        import pytesseract
+
+        for ruta in RUTAS_TESSERACT:
+            if ruta.is_file():
+                pytesseract.pytesseract.tesseract_cmd = str(ruta)
+                break
+
+    with tempfile.TemporaryDirectory() as carpeta:
+        ruta_pdf = Path(carpeta) / "programa.pdf"
+        ruta_pdf.write_bytes(archivo.getvalue())
+        datos_json, texto_completo = procesar_pdf(ruta_pdf)
+
+    CARPETA_SALIDA.mkdir(exist_ok=True)
+    RUTA_EVENTOS.write_text(json.dumps(datos_json, ensure_ascii=False, indent=2), encoding="utf-8")
+    RUTA_TEXTO.write_text(texto_completo or "", encoding="utf-8")
     return datos_json, texto_completo
+
+
+def reiniciar_datos(datos_json, texto_completo, origen):
+    st.session_state.datos_json = preparar_datos(datos_json)
+    st.session_state.texto_completo = texto_completo if isinstance(texto_completo, str) else ""
+    st.session_state.origen_datos = origen
+    st.session_state.mensajes = []
+    st.session_state.pop("eventos_indice", None)
+    st.session_state.pop("error_datos", None)
 
 
 def quitar_acentos(texto):
@@ -162,12 +209,13 @@ def obtener_modelo_embeddings():
 def inicializar_estado():
     if "datos_json" not in st.session_state:
         try:
-            datos_json, texto_completo = cargar_datos()
+            datos_json, texto_completo, origen = cargar_datos()
         except Exception as e:
             st.session_state.error_datos = f"Error al cargar los datos del programa: {e}"
-            datos_json, texto_completo = {}, ""
+            datos_json, texto_completo, origen = {}, "", "sin datos"
         st.session_state.datos_json = preparar_datos(datos_json)
         st.session_state.texto_completo = texto_completo if isinstance(texto_completo, str) else ""
+        st.session_state.origen_datos = origen
 
     if "mensajes" not in st.session_state:
         st.session_state.mensajes = []
@@ -193,6 +241,24 @@ def inicializar_estado():
 # INTERFAZ
 # ============================================================
 inicializar_estado()
+
+with st.sidebar:
+    st.header("📄 Programa en PDF")
+    st.caption(f"Datos actuales: {st.session_state.origen_datos}")
+    archivo_pdf = st.file_uploader("Sube el programa", type=["pdf"])
+    if st.button("Procesar PDF", disabled=archivo_pdf is None, use_container_width=True):
+        try:
+            with st.spinner("Leyendo el PDF con OCR y NVIDIA NIM... puede tardar."):
+                datos_pdf, texto_pdf = procesar_pdf_subido(archivo_pdf)
+            reiniciar_datos(datos_pdf, texto_pdf, archivo_pdf.name)
+            st.rerun()
+        except ImportError as e:
+            st.error(f"Faltan dependencias del procesador de PDF: {e}")
+        except Exception as e:
+            st.error(f"No se pudo procesar el PDF: {e}")
+    if st.session_state.origen_datos != "datos demo" and st.button("Volver a datos demo", use_container_width=True):
+        reiniciar_datos(DATOS_DEMO, "", "datos demo")
+        st.rerun()
 
 datos_json = st.session_state.datos_json
 eventos = datos_json["eventos"]
