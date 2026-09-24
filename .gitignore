@@ -2,7 +2,9 @@
 .env.*
 !.env.example
 .venv/
+venv/
 __pycache__/
 *.pyc
 .DS_Store
 output/
+.streamlit/secrets.toml
