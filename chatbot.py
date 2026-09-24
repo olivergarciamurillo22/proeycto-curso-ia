@@ -118,6 +118,14 @@ def generar_con_nim(messages):
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
+    if NIM_MODEL in ('google/gemma-4-31b-it', 'meta/llama-3.2-11b-vision-instruct',
+                     'meta/llama-3.2-90b-vision-instruct'):
+        instrucciones = '\n'.join(m['content'] for m in messages if m['role'] == 'system')
+        messages = [dict(m) for m in messages if m['role'] != 'system']
+        for mensaje in messages:
+            if mensaje['role'] == 'user':
+                mensaje['content'] = instrucciones + '\n\n' + mensaje['content']
+                break
     payload = {
         "model": NIM_MODEL,
         "messages": messages,
@@ -126,21 +134,27 @@ def generar_con_nim(messages):
         "max_tokens": 700,
         "stream": False,
     }
+    if NIM_MODEL == 'google/gemma-4-31b-it':
+        payload['chat_template_kwargs'] = {'enable_thinking': False}
 
     try:
-        respuesta = requests.post(NIM_URL, headers=headers, json=payload, timeout=NIM_TIMEOUT)
+        respuesta = requests.post(NIM_URL, headers=headers, json=payload, timeout=NIM_TIMEOUT, allow_redirects=False)
     except requests.exceptions.Timeout:
         raise RuntimeError("NVIDIA NIM ha tardado demasiado en responder. Inténtalo de nuevo.")
     except requests.exceptions.RequestException as e:
         raise RuntimeError(f"No se pudo conectar con NVIDIA NIM: {type(e).__name__}")
 
     if respuesta.status_code != 200:
-        detalle = respuesta.text[:300].replace(NVIDIA_API_KEY, "***")
-        raise RuntimeError(f"NVIDIA NIM devolvió el error {respuesta.status_code}: {detalle}")
+        raise RuntimeError(f"NVIDIA NIM devolvió HTTP {respuesta.status_code}. Revisa modelo, credencial y cuota.")
 
     try:
-        contenido = respuesta.json()["choices"][0]["message"]["content"]
-    except (ValueError, KeyError, IndexError, TypeError):
+        choice = respuesta.json()["choices"][0]
+        if choice.get('finish_reason') == 'length':
+            raise RuntimeError('NVIDIA devolvió una respuesta truncada. Prueba una pregunta más concreta.')
+        contenido = choice["message"]["content"]
+        if not isinstance(contenido, str):
+            raise RuntimeError('Respuesta inesperada de NVIDIA NIM.')
+    except (ValueError, KeyError, IndexError, TypeError, AttributeError):
         raise RuntimeError("Respuesta inesperada de NVIDIA NIM.")
 
     contenido = (contenido or "").strip()

@@ -74,7 +74,8 @@ ICONOS_CATEGORIA = {
 
 CARPETA_SALIDA = Path(__file__).resolve().parent / "output"
 RUTA_EVENTOS = CARPETA_SALIDA / "eventos.json"
-RUTA_TEXTO = CARPETA_SALIDA / "texto.txt"
+RUTA_TEXTO = CARPETA_SALIDA / "texto_extraido.txt"
+RUTA_TECNOLOGIA = CARPETA_SALIDA / "tecnologia.json"
 RUTAS_TESSERACT = [
     Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Tesseract-OCR" / "tesseract.exe",
     Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Tesseract-OCR" / "tesseract.exe",
@@ -89,13 +90,17 @@ RUTAS_TESSERACT = [
 def cargar_datos():
     if RUTA_EVENTOS.is_file():
         datos_json = json.loads(RUTA_EVENTOS.read_text(encoding="utf-8"))
-        texto_completo = RUTA_TEXTO.read_text(encoding="utf-8") if RUTA_TEXTO.is_file() else ""
-        return datos_json, texto_completo, "output/eventos.json"
+        ruta_texto = RUTA_TEXTO if RUTA_TEXTO.is_file() else CARPETA_SALIDA / "texto.txt"
+        texto_completo = ruta_texto.read_text(encoding="utf-8") if ruta_texto.is_file() else ""
+        origen = "output/eventos.json"
+        if (CARPETA_SALIDA / 'LEEME_SIMULACION.txt').is_file():
+            origen = "simulación local (NVIDIA no verificado)"
+        return datos_json, texto_completo, origen
     return DATOS_DEMO, "", "datos demo"
 
 
 def procesar_pdf_subido(archivo):
-    from document_processor import procesar_pdf
+    from document_processor import procesar_pdf_con_informe, obtener_info_tecnica
 
     if not shutil.which("tesseract"):
         import pytesseract
@@ -108,11 +113,19 @@ def procesar_pdf_subido(archivo):
     with tempfile.TemporaryDirectory() as carpeta:
         ruta_pdf = Path(carpeta) / "programa.pdf"
         ruta_pdf.write_bytes(archivo.getvalue())
-        datos_json, texto_completo = procesar_pdf(ruta_pdf)
+        datos_json, texto_completo, informe = procesar_pdf_con_informe(ruta_pdf)
+
+    if informe['estado'] == 'fallido':
+        raise RuntimeError('No se pudo estructurar ninguna página. Se conserva el programa anterior. Revisa el modelo y la conexión NVIDIA.')
 
     CARPETA_SALIDA.mkdir(exist_ok=True)
     RUTA_EVENTOS.write_text(json.dumps(datos_json, ensure_ascii=False, indent=2), encoding="utf-8")
     RUTA_TEXTO.write_text(texto_completo or "", encoding="utf-8")
+    tecnologia = obtener_info_tecnica()
+    tecnologia['ultima_ejecucion'] = informe
+    RUTA_TECNOLOGIA.write_text(json.dumps(tecnologia, ensure_ascii=False, indent=2), encoding='utf-8')
+    (CARPETA_SALIDA / 'LEEME_SIMULACION.txt').unlink(missing_ok=True)
+    st.session_state.informe_procesamiento = informe
     return datos_json, texto_completo
 
 
@@ -123,6 +136,8 @@ def reiniciar_datos(datos_json, texto_completo, origen):
     st.session_state.mensajes = []
     st.session_state.pop("eventos_indice", None)
     st.session_state.pop("error_datos", None)
+    if origen == 'datos demo':
+        st.session_state.pop('informe_procesamiento', None)
 
 
 def quitar_acentos(texto):
@@ -216,6 +231,11 @@ def inicializar_estado():
         st.session_state.datos_json = preparar_datos(datos_json)
         st.session_state.texto_completo = texto_completo if isinstance(texto_completo, str) else ""
         st.session_state.origen_datos = origen
+        if RUTA_TECNOLOGIA.is_file():
+            try:
+                st.session_state.informe_procesamiento = json.loads(RUTA_TECNOLOGIA.read_text(encoding='utf-8')).get('ultima_ejecucion')
+            except (ValueError, OSError):
+                pass
 
     if "mensajes" not in st.session_state:
         st.session_state.mensajes = []
@@ -265,6 +285,11 @@ eventos = datos_json["eventos"]
 
 st.title("🎉 Agenda Inteligente de Almería")
 st.caption("Consulta toda la programación y pregunta a nuestra IA.")
+if st.session_state.origen_datos == 'datos demo' or 'simulación' in st.session_state.origen_datos:
+    st.info('Modo demostración: estos eventos son ficticios, no son la programación oficial.')
+informe_actual = st.session_state.get('informe_procesamiento') or {}
+if informe_actual.get('estado') == 'parcial':
+    st.warning('Programa incompleto: algunas páginas no se han podido procesar. Consulta Ajustes y tecnología.')
 
 if st.session_state.get("error_datos"):
     st.error(st.session_state.error_datos)
@@ -279,7 +304,11 @@ m2.metric("Lugares", len(lugares))
 m3.metric("Categorías", len(categorias))
 m4.metric("Fechas", len(fechas))
 
-tab_programa, tab_chat = st.tabs(["📅 Programa", "🤖 Pregunta a la IA"])
+tab_programa, tab_chat, tab_ajustes = st.tabs(["📅 Programa", "🤖 Pregunta a la IA", "⚙️ Ajustes y tecnología"])
+
+with tab_ajustes:
+    from ajustes import mostrar_ajustes
+    mostrar_ajustes(informe_actual)
 
 with tab_programa:
     st.subheader(datos_json["documento"]["titulo"])

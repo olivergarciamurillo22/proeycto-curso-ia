@@ -375,6 +375,61 @@ class ProcessorTests(unittest.TestCase):
             text = (out / 'texto_extraido.txt').read_text(encoding='utf-8')
             self.assertIn('Página 1', text)
             self.assertIn('Página 2', text)
+            tech = json.loads((out / 'tecnologia.json').read_text(encoding='utf-8'))
+            self.assertEqual(tech['ultima_ejecucion']['estado'], 'completo')
+            self.assertNotIn('clave-ficticia-tests', json.dumps(tech))
+
+    @patch('document_processor.requests.post')
+    def test_informe_modos_y_recuento(self, post):
+        post.side_effect = [respuesta_http(400), respuesta_http(), respuesta_http()]
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'programa.pdf'
+            crear_pdf(path)
+            with self.assertLogs(dp.logger):
+                datos, texto, informe = dp.procesar_pdf_con_informe(path)
+        self.assertEqual(informe['estado'], 'completo')
+        self.assertEqual(informe['paginas_correctas'], 2)
+        self.assertEqual([p['modo'] for p in informe['paginas']], ['solo_texto', 'imagen_y_texto'])
+        self.assertEqual(informe['eventos_finales'], len(datos['eventos']))
+
+    @patch('document_processor.analizar_pagina_con_nim')
+    def test_informe_parcial(self, analizar):
+        analizar.side_effect = [dp.ErrorNIM('fallo'), resultado()]
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'programa.pdf'
+            crear_pdf(path)
+            with self.assertLogs(dp.logger):
+                _, _, informe = dp.procesar_pdf_con_informe(path)
+        self.assertEqual(informe['estado'], 'parcial')
+        self.assertEqual(informe['paginas_correctas'], 1)
+        self.assertIn('extraccion_nim_fallida', informe['paginas'][0]['advertencias'])
+
+    def test_info_tecnica_no_expone_secretos(self):
+        info = dp.obtener_info_tecnica()
+        self.assertNotIn('clave-ficticia-tests', json.dumps(info))
+        self.assertNotIn('NVIDIA_API_KEY', info)
+        self.assertTrue(info['credencial_configurada'])
+
+    @patch('document_processor.requests.post')
+    def test_llama_vision_sin_system(self, post):
+        post.return_value = respuesta_http()
+        with patch.dict(os.environ, {'NVIDIA_MODEL': 'meta/llama-3.2-11b-vision-instruct'}):
+            dp._llamar_nim('texto')
+        mensajes = post.call_args.kwargs['json']['messages']
+        self.assertEqual(len(mensajes), 1)
+        self.assertEqual(mensajes[0]['role'], 'user')
+        self.assertIn(dp.SYSTEM_PROMPT, mensajes[0]['content'])
+
+    @patch('document_processor.procesar_pdf_con_informe')
+    def test_cli_fallida_conserva_salidas(self, procesar):
+        procesar.return_value = ({'documento': {}, 'eventos': []}, '', {'estado': 'fallido'})
+        with tempfile.TemporaryDirectory() as folder:
+            out = Path(folder)
+            (out / 'eventos.json').write_text('resultado anterior', encoding='utf-8')
+            with patch.object(sys, 'argv', ['document_processor.py', '--output', folder]), self.assertRaises(SystemExit):
+                dp.main()
+            self.assertEqual((out / 'eventos.json').read_text(), 'resultado anterior')
+            self.assertTrue((out / 'fallo_tecnologia.json').is_file())
 
 
 def demo_sin_credenciales():

@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import time
+from importlib.metadata import version, PackageNotFoundError
 
 import pymupdf as fitz
 from PIL import Image
@@ -124,8 +125,9 @@ def _llamar_nim(contenido):
     messages = [
         {'role': 'system', 'content': SYSTEM_PROMPT},
         {'role': 'user', 'content': contenido}]
-    # El endpoint Gemma documenta únicamente user/assistant, sin rol system.
-    if model == 'google/gemma-4-31b-it':
+    # Estos endpoints de visión documentan user/assistant, sin rol system.
+    if model in ('google/gemma-4-31b-it', 'meta/llama-3.2-11b-vision-instruct',
+                 'meta/llama-3.2-90b-vision-instruct'):
         if isinstance(contenido, list):
             contenido = [dict(part) for part in contenido]
             for part in contenido:
@@ -163,7 +165,7 @@ def _llamar_nim(contenido):
                 raise ErrorNIM('Respuesta NIM inválida o con esquema incorrecto.') from None
 
 
-def analizar_pagina_con_nim(numero_pagina, imagen, texto_ocr, texto_nativo):
+def analizar_pagina_con_nim(numero_pagina, imagen, texto_ocr, texto_nativo, *, informe=None):
     _configuracion()
     texto = combinar_textos(texto_nativo, texto_ocr)
     contenido = f'Página {numero_pagina}. Extrae los eventos del siguiente documento:\n{texto}'
@@ -172,14 +174,49 @@ def analizar_pagina_con_nim(numero_pagina, imagen, texto_ocr, texto_nativo):
         imagen.convert('RGB').save(buffer, format='JPEG', quality=85)
         encoded = base64.b64encode(buffer.getvalue()).decode('ascii')
         try:
-            return _llamar_nim([
+            datos = _llamar_nim([
                 {'type': 'image_url', 'image_url': {'url': f'data:image/jpeg;base64,{encoded}'}},
                 {'type': 'text', 'text': contenido}])
-        except ErrorNIM:
-            logger.warning('NIM multimodal falló. Usando fallback basado en texto.')
+            if informe is not None:
+                informe['modo'] = 'imagen_y_texto'
+            return datos
+        except ErrorNIM as exc:
+            logger.warning('NIM multimodal falló. Usando fallback basado en texto. %s', exc)
     if not texto.strip():
         raise ErrorNIM('No hay texto extraído para el fallback de esta página.')
-    return _llamar_nim(contenido)
+    datos = _llamar_nim(contenido)
+    if informe is not None:
+        informe['modo'] = 'solo_texto'
+    return datos
+
+
+def obtener_info_tecnica():
+    """Metadatos permitidos para Ajustes. Nunca devuelve claves ni variables arbitrarias."""
+    load_dotenv(Path(__file__).resolve().parent / '.env', override=False)
+    tecnologias = []
+    for paquete, uso in [('pymupdf', 'Lectura y renderizado de PDF'),
+                         ('pillow', 'Preparación de imágenes'),
+                         ('pytesseract', 'OCR mediante Tesseract'),
+                         ('requests', 'Conexión HTTP con NVIDIA'),
+                         ('python-dotenv', 'Configuración del servidor')]:
+        try:
+            instalada = version(paquete)
+        except PackageNotFoundError:
+            instalada = None
+        tecnologias.append({'nombre': paquete, 'version': instalada, 'uso': uso})
+    try:
+        ocr_version = str(pytesseract.get_tesseract_version())
+    except (RuntimeError, OSError):
+        ocr_version = None
+    return {
+        'proveedor': 'NVIDIA NIM',
+        'modelo_configurado': os.getenv('NVIDIA_MODEL', '').strip() or None,
+        'credencial_configurada': bool(os.getenv('NVIDIA_API_KEY', '').strip()),
+        'tecnologias': tecnologias,
+        'ocr': {'motor': 'Tesseract', 'version': ocr_version, 'idioma': _idioma_ocr()},
+        'privacidad': {'ocr': 'local', 'inferencia': 'API externa de NVIDIA',
+                       'contenido_enviado': ['imagen de página', 'texto extraído']},
+    }
 
 
 def _combinar_resultados(resultados):
@@ -208,29 +245,43 @@ def procesar_pdf(ruta_pdf):
     Configuración ausente/PDF inválido generan excepción. Fallos parciales de NIM
     producen datos parciales; si falla todo NIM, devuelve eventos=[] con warnings.
     """
+    datos, texto, _ = procesar_pdf_con_informe(ruta_pdf)
+    return datos, texto
+
+
+def procesar_pdf_con_informe(ruta_pdf):
+    """API opcional para la web: (datos, texto, informe de ejecución sin secretos)."""
+    inicio = time.monotonic()
     ruta = Path(ruta_pdf)
     if not ruta.is_file():
         raise FileNotFoundError(f'PDF no encontrado: {ruta}')
-    _configuracion()
+    _, modelo, _ = _configuracion()
     textos, resultados = [], []
+    informe = {'modelo': modelo, 'paginas': [], 'estado': 'fallido'}
     idioma = _idioma_ocr()
     with fitz.open(ruta) as pdf:
         if not pdf.is_pdf or pdf.needs_pass or not len(pdf):
             raise ValueError('Se requiere un PDF no vacío y sin contraseña.')
         for indice in range(len(pdf)):
             numero = indice + 1
+            detalle = {'pagina': numero, 'estado': 'fallido', 'modo': None,
+                       'caracteres_nativos': 0, 'caracteres_ocr': 0,
+                       'eventos_extraidos': 0, 'advertencias': []}
+            informe['paginas'].append(detalle)
             nativo, ocr, imagen = '', '', None
             logger.info('Procesando página %s/%s', numero, len(pdf))
             try:
                 pagina = pdf.load_page(indice)
             except Exception:
                 logger.warning('Página %s ilegible.', numero)
+                detalle['advertencias'].append('pagina_ilegible')
                 textos.append(f'--- Página {numero} ---\n[No se pudo leer la página]')
                 continue
             try:
                 nativo = pagina.get_text('text')
             except Exception:
                 logger.warning('Página %s: no se pudo extraer texto nativo.', numero)
+                detalle['advertencias'].append('texto_nativo_fallido')
             try:
                 pix = pagina.get_pixmap(matrix=fitz.Matrix(2, 2), colorspace=fitz.csRGB, alpha=False)
                 imagen = Image.frombytes('RGB', (pix.width, pix.height), pix.samples)
@@ -238,18 +289,34 @@ def procesar_pdf(ruta_pdf):
                     ocr = pytesseract.image_to_string(imagen, lang=idioma, timeout=60)
             except Exception:
                 logger.warning('Página %s: renderizado/OCR falló; se conserva el texto nativo.', numero)
+                detalle['advertencias'].append('renderizado_u_ocr_fallido')
+            if idioma is None:
+                detalle['advertencias'].append('ocr_no_disponible')
+            detalle['caracteres_nativos'] = len(nativo)
+            detalle['caracteres_ocr'] = len(ocr)
             texto = combinar_textos(nativo, ocr)
             textos.append(f'--- Página {numero} ---\n{texto}')
             try:
-                resultados.append(analizar_pagina_con_nim(numero, imagen, ocr, nativo))
+                resultado = analizar_pagina_con_nim(numero, imagen, ocr, nativo, informe=detalle)
+                resultados.append(resultado)
+                detalle['estado'] = 'completo'
+                detalle['eventos_extraidos'] = len(resultado['eventos'])
             except (ErrorNIM, ValueError):
+                detalle['advertencias'].append('extraccion_nim_fallida')
                 logger.warning('Página %s: extracción NIM fallida; resultado incompleto.', numero)
             finally:
                 if imagen is not None:
                     imagen.close()
     if not resultados:
         logger.warning('Ninguna página fue estructurada por NIM. eventos=[] NO significa ausencia de eventos.')
-    return _combinar_resultados(resultados), '\n\n'.join(textos)
+    informe['paginas_totales'] = len(informe['paginas'])
+    informe['paginas_correctas'] = len(resultados)
+    informe['estado'] = ('completo' if len(resultados) == len(informe['paginas'])
+                         else 'parcial' if resultados else 'fallido')
+    informe['duracion_segundos'] = round(time.monotonic() - inicio, 3)
+    datos = _combinar_resultados(resultados)
+    informe['eventos_finales'] = len(datos['eventos'])
+    return datos, '\n\n'.join(textos), informe
 
 
 def main():
@@ -258,11 +325,18 @@ def main():
     parser.add_argument('--output', default='output')
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
-    datos, texto = procesar_pdf(args.pdf)
+    datos, texto, informe = procesar_pdf_con_informe(args.pdf)
     destino = Path(args.output)
     destino.mkdir(parents=True, exist_ok=True)
+    tecnologia = obtener_info_tecnica()
+    tecnologia['ultima_ejecucion'] = informe
+    if informe['estado'] == 'fallido':
+        (destino / 'fallo_tecnologia.json').write_text(json.dumps(tecnologia, ensure_ascii=False, indent=2), encoding='utf-8')
+        raise SystemExit('Ninguna página se pudo estructurar. Salidas anteriores conservadas; consulta fallo_tecnologia.json.')
     (destino / 'eventos.json').write_text(json.dumps(datos, ensure_ascii=False, indent=2), encoding='utf-8')
     (destino / 'texto_extraido.txt').write_text(texto, encoding='utf-8')
+    (destino / 'tecnologia.json').write_text(json.dumps(tecnologia, ensure_ascii=False, indent=2), encoding='utf-8')
+    (destino / 'LEEME_SIMULACION.txt').unlink(missing_ok=True)
     logger.info('Guardados eventos.json y texto_extraido.txt en %s. Revisa los warnings de páginas fallidas.', destino)
 
 

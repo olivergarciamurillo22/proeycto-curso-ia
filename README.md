@@ -50,19 +50,20 @@ sobre `.env`.
 ```dotenv
 NVIDIA_API_KEY=
 NVIDIA_NIM_URL=https://integrate.api.nvidia.com/v1/chat/completions
-NVIDIA_MODEL=google/gemma-4-31b-it
+NVIDIA_MODEL=meta/llama-3.2-11b-vision-instruct
 ```
 
-Modelo configurado el 24/09/2026: `google/gemma-4-31b-it`. Se ha comprobado su
-presencia en `GET https://integrate.api.nvidia.com/v1/models` (HTTP 200, sin clave).
-La [referencia oficial del endpoint](https://docs.api.nvidia.com/nim/reference/google-gemma-4-31b-it-infer)
-documenta `/v1/chat/completions`, imágenes `image_url` con data URI, texto y los
-roles `user`/`assistant`. Para este modelo se incorporan las instrucciones en el
-mensaje de usuario y se desactiva el razonamiento. La [ficha oficial del modelo](https://docs.api.nvidia.com/nim/reference/google-gemma-4-31b-it)
-recomienda colocar la imagen antes del texto, como hace este módulo.
-Esto confirma el contrato documentado y su presencia en el catálogo, **no** una
-inferencia real ni los permisos/cuota de tu cuenta. `.env.example` mantiene el
-modelo vacío para que siga siendo una plantilla configurable.
+Modelo verificado con inferencia REAL el 24/09/2026:
+`meta/llama-3.2-11b-vision-instruct`, usando el endpoint `/v1/chat/completions`.
+Se procesaron dos páginas sintéticas (digital y escaneada) con imagen + texto,
+recuperando nombre, fecha, hora y lugar; la repetición se combinó en un evento.
+También se verificó una respuesta real del chat y embeddings locales de 384 dimensiones.
+La [referencia de NVIDIA](https://docs.api.nvidia.com/nim/reference/meta-llama-3_2-11b-vision-instruct-infer)
+documenta entradas de imagen base64 y roles user/assistant; ambos clientes adaptan
+las instrucciones para evitar un rol system no soportado.
+Gemma 4 agotó el tiempo de espera en esta sesión, por lo que se sustituyó por Llama
+en el `.env` local. `.env.example` mantiene el modelo vacío como plantilla.
+Estas pruebas no sustituyen la revisión de un programa real ni garantizan disponibilidad futura.
 
 No incluyas claves en código, comandos compartidos ni Git. `.env` está ignorado.
 La API recibe el contenido de cada página del PDF. Se intenta una petición con
@@ -107,7 +108,9 @@ Para generar los dos archivos de entrega:
 python document_processor.py data/programa.pdf
 ```
 
-Produce `output/eventos.json` y `output/texto_extraido.txt` (ignorados por Git).
+Produce `output/eventos.json`, `output/texto_extraido.txt` y `output/tecnologia.json`
+(ignorados por Git). Si todas las páginas fallan, la CLI termina con error,
+conserva las salidas anteriores y escribe `output/fallo_tecnologia.json`.
 `--output otra_carpeta` permite elegir destino. Una ejecución posterior reemplaza
 estos dos archivos de salida.
 
@@ -158,7 +161,7 @@ La demo reemplaza esas salidas: úsala antes de procesar el PDF real o guarda la
 salidas reales en otro directorio. Los tests bloquean por defecto las llamadas HTTP
 no simuladas explícitamente.
 
-## Prueba real pendiente
+## Reproducir la prueba real
 
 1. Pega la clave en `NVIDIA_API_KEY` dentro de `.env`.
 2. Copia el PDF real a `data/programa.pdf` (la carpeta está preparada).
@@ -172,3 +175,38 @@ python document_processor.py data/programa.pdf
 También puedes omitir el argumento: el PDF predeterminado es `data/programa.pdf`.
 Comprueba los warnings y revisa las dos salidas; si la cuenta no permite acceder
 al modelo configurado, selecciona otro modelo multimodal habilitado en NVIDIA.
+
+Si todavía no tienes el programa real, ejecuta `python verificar_nvidia.py`.
+Este comando consume la API real con un PDF sintético y verifica datos conocidos.
+Es optativo y no forma parte de la suite de tests. Guarda la evidencia en
+`output/verificacion_nvidia/`. `python verificar_nvidia.py --pdf data/programa.pdf`
+verifica la ejecución sobre vuestro documento, sin presuponer su número de eventos.
+
+## Web de Pedro y ajustes
+
+```bash
+python -m streamlit run app.py
+python -m unittest discover -v
+```
+
+La web integra la subida de PDF, filtros, chat y «Ajustes y tecnología». El panel
+`ajustes.py` muestra modelos configurados, versiones, OCR, privacidad y resultado
+de la extracción. Usa `obtener_info_tecnica()`; no devuelve claves ni un volcado
+de variables de entorno. El chat puede elegir un modelo diferente con `NIM_MODEL`;
+si no está definido usa `NVIDIA_MODEL`.
+
+Para interfaces que necesiten estados por página:
+
+```python
+from document_processor import procesar_pdf_con_informe
+datos, texto, informe = procesar_pdf_con_informe('data/programa.pdf')
+```
+
+`informe['estado']` es `completo`, `parcial` o `fallido`; las páginas incluyen
+el modo `imagen_y_texto` o `solo_texto`, caracteres OCR/nativos y advertencias.
+«Completo» significa que todas las páginas se estructuraron, no que el contenido
+sea infalible. La firma original `procesar_pdf(ruta_pdf)` sigue intacta.
+
+La propuesta de diseño e interacción para Pedro está en
+[docs/INTERFAZ_PEDRO.md](docs/INTERFAZ_PEDRO.md). Las pruebas de web con Streamlit
+AppTest cubren arranque, filtros y ajustes sin red; no sustituyen una revisión visual.
