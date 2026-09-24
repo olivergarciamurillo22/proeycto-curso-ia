@@ -10,7 +10,7 @@ from pathlib import Path
 import re
 import time
 
-import fitz
+import pymupdf as fitz
 from PIL import Image
 import pytesseract
 import requests
@@ -54,8 +54,10 @@ def _validar(obj):
         raise ValueError('documento debe ser un objeto.')
 
     def campo(value):
-        if value is None or isinstance(value, str):
+        if value is None:
             return value
+        if isinstance(value, str):
+            return value.strip() or None
         raise ValueError('Los campos deben ser strings o null.')
 
     eventos = []
@@ -72,13 +74,19 @@ def parsear_json_nim(respuesta):
     if not isinstance(respuesta, str):
         raise ValueError('La respuesta NIM debe ser texto.')
     decoder = json.JSONDecoder()
+    error = None
     for match in re.finditer(r'\{', respuesta):
         try:
             obj, _ = decoder.raw_decode(respuesta[match.start():])
         except json.JSONDecodeError:
             continue
         if isinstance(obj, dict) and ('documento' in obj or 'eventos' in obj):
-            return _validar(obj)
+            try:
+                return _validar(obj)
+            except ValueError as exc:
+                error = exc
+    if error:
+        raise error
     raise ValueError('NIM no devolvió un JSON completo con el esquema esperado.')
 
 
@@ -87,13 +95,13 @@ def combinar_textos(texto_nativo, texto_ocr):
     native, ocr = texto_nativo.strip(), texto_ocr.strip()
     principal, extra = (native, ocr) if len(native) >= 80 else (ocr or native, native)
     normalizar = lambda s: ' '.join(s.casefold().split())
-    conocido = normalizar(principal)
+    conocido = {normalizar(linea) for linea in principal.splitlines()}
     lineas = []
     for linea in extra.splitlines():
         norm = normalizar(linea)
         if norm and norm not in conocido:
             lineas.append(linea)
-            conocido += ' ' + norm
+            conocido.add(norm)
     return principal + ('\n\n[Texto complementario]\n' + '\n'.join(lineas) if lineas else '')
 
 
@@ -113,9 +121,22 @@ def _idioma_ocr():
 
 def _llamar_nim(contenido):
     key, model, url = _configuracion()
-    payload = {'model': model, 'messages': [
+    messages = [
         {'role': 'system', 'content': SYSTEM_PROMPT},
-        {'role': 'user', 'content': contenido}], 'temperature': 0, 'max_tokens': 4096}
+        {'role': 'user', 'content': contenido}]
+    # El endpoint Gemma documenta únicamente user/assistant, sin rol system.
+    if model == 'google/gemma-4-31b-it':
+        if isinstance(contenido, list):
+            contenido = [dict(part) for part in contenido]
+            for part in contenido:
+                if part.get('type') == 'text':
+                    part['text'] = SYSTEM_PROMPT + '\n\n' + part['text']
+        else:
+            contenido = SYSTEM_PROMPT + '\n\n' + contenido
+        messages = [{'role': 'user', 'content': contenido}]
+    payload = {'model': model, 'messages': messages, 'temperature': 0, 'max_tokens': 4096}
+    if model == 'google/gemma-4-31b-it':
+        payload['chat_template_kwargs'] = {'enable_thinking': False}
     for intento in range(3):
         try:
             response = requests.post(url, headers={'Authorization': f'Bearer {key}'},
@@ -138,7 +159,7 @@ def _llamar_nim(contenido):
                 if choice.get('finish_reason') == 'length':
                     raise ErrorNIM('Respuesta NIM truncada; la página requiere más tokens.')
                 return parsear_json_nim(choice['message']['content'])
-            except (ValueError, KeyError, IndexError, TypeError):
+            except (ValueError, KeyError, IndexError, TypeError, AttributeError):
                 raise ErrorNIM('Respuesta NIM inválida o con esquema incorrecto.') from None
 
 
@@ -152,8 +173,8 @@ def analizar_pagina_con_nim(numero_pagina, imagen, texto_ocr, texto_nativo):
         encoded = base64.b64encode(buffer.getvalue()).decode('ascii')
         try:
             return _llamar_nim([
-                {'type': 'text', 'text': contenido},
-                {'type': 'image_url', 'image_url': {'url': f'data:image/jpeg;base64,{encoded}'}}])
+                {'type': 'image_url', 'image_url': {'url': f'data:image/jpeg;base64,{encoded}'}},
+                {'type': 'text', 'text': contenido}])
         except ErrorNIM:
             logger.warning('NIM multimodal falló. Usando fallback basado en texto.')
     if not texto.strip():
@@ -233,7 +254,7 @@ def procesar_pdf(ruta_pdf):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('pdf')
+    parser.add_argument('pdf', nargs='?', default='data/programa.pdf')
     parser.add_argument('--output', default='output')
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
@@ -241,8 +262,8 @@ def main():
     destino = Path(args.output)
     destino.mkdir(parents=True, exist_ok=True)
     (destino / 'eventos.json').write_text(json.dumps(datos, ensure_ascii=False, indent=2), encoding='utf-8')
-    (destino / 'texto.txt').write_text(texto, encoding='utf-8')
-    logger.info('Guardados eventos.json y texto.txt en %s. Revisa los warnings de páginas fallidas.', destino)
+    (destino / 'texto_extraido.txt').write_text(texto, encoding='utf-8')
+    logger.info('Guardados eventos.json y texto_extraido.txt en %s. Revisa los warnings de páginas fallidas.', destino)
 
 
 if __name__ == '__main__':
